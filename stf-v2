@@ -1,0 +1,355 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<title>Audio to Freqs — 99-Range Encoder</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<style>
+  body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial;line-height:1.4;margin:18px;background:#fdfdfd}
+  h1{margin:.1em 0 0.2em; color: #333;}
+  .row{display:flex;gap:8px;align-items:center;margin:8px 0;flex-wrap: wrap;}
+  input[type="number"]{width:70px; padding: 4px; border: 1px solid #ccc; border-radius: 4px;}
+  input[type="file"]{display:none}
+  button{padding:8px 12px;border-radius:6px;border:1px solid #ccc;background:#f6f6f6;cursor:pointer; transition: background 0.2s;}
+  button:hover{background:#ededed}
+  button:disabled{opacity:.5;cursor:default}
+  #process{background: #4D97FF; color: white; border: none; font-weight: bold;}
+  #progress{width:100%;height:12px;background:#eee;border-radius:6px;overflow:hidden;margin-top:8px}
+  #bar{height:100%;width:0;background:linear-gradient(90deg,#4D97FF,#3a76cc)}
+  #log{white-space:pre-wrap;background:#1a1a1a;color:#00ff41;padding:12px;border-radius:6px;height:220px;overflow:auto;font-family:monospace;font-size:12px;border: 1px solid #333;}
+  label{font-size:13px; font-weight: 500;}
+  .small{font-size:13px;color:#666}
+</style>
+</head>
+<body>
+
+<h1>Audio to Freqs — Numeric Output</h1>
+<p class="small">Bark-spaced bands, identical to the sound generator's "Bark" spacing. Lowest Hz, Highest Hz and Bands are adjustable (defaults 20 / 20000 / 128). Output: <b>freqs.txt</b> (00-99 concatenated values, 2 digits per band).</p>
+
+<div class="row">
+  <input id="file" type="file" accept="audio/*"/>
+  <button id="pick">Choose audio file</button>
+  <div id="fileName" class="small">No file selected</div>
+</div>
+
+<div class="row">
+  <label>Bands: <input id="bands" type="number" value="128" min="1" max="1024" step="1" /></label>
+  <label>Lowest Hz: <input id="lowHz" type="number" value="20" min="1" max="22000" step="any" style="width:90px" /></label>
+  <label>Highest Hz: <input id="highHz" type="number" value="20000" min="1" max="22000" step="any" style="width:90px" /></label>
+  <label>PPS: <input id="pps" type="number" value="30" /></label>
+  <label>FFT size: <input id="fftSize" type="number" value="4096" /></label>
+  <label>Gamma: <input id="gamma" type="number" value="1.0" step="0.1" /></label>
+</div>
+
+<div class="row">
+  <button id="process">Process → freqs.txt</button>
+  <button id="preview" disabled>Preview WAV</button>
+  <button id="downloadWav" disabled>Download WAV</button>
+  <button id="manifest">Download band frequencies</button>
+  <div style="flex:1"></div>
+  <label class="small">Frames: <span id="framesCount">0</span></label>
+</div>
+
+<div id="bandInfo" class="small" style="margin:4px 0 8px"></div>
+
+<div id="progress"><div id="bar"></div></div>
+<div id="log"></div>
+
+<script>
+const DEFAULT_BANDS = 128, MIN_BANDS = 1, MAX_BANDS = 1024;
+const DEFAULT_LOW_HZ = 20, DEFAULT_HIGH_HZ = 20000;   // same defaults as sine_generator.py
+const MIN_FREQ_HZ = 1, MAX_FREQ_HZ = 22000;           // same limits as sine_generator.py
+let TARGET_BANDS = DEFAULT_BANDS;   // number of bands = number of sounds in the generator
+// Band layout: Bark spacing, identical to the sound generator's "Bark" option.
+// The Lowest Hz / Highest Hz / Bands boxes must equal Lowest Hz / Highest Hz / Total sounds used in the generator.
+// f(n) = Wi( W(A) + n/(X-1) * (W(B) - W(A)) ),  W(f) = 26.81*f/(1960+f) - 0.53 (Traunmueller),  Wi(z) = 1960*(z+0.53)/(26.28-z)
+let LOW_HZ = DEFAULT_LOW_HZ, HIGH_HZ = DEFAULT_HIGH_HZ;
+const barkOf   = f => 26.81 * f / (1960 + f) - 0.53;
+const hzOfBark = z => 1960 * (z + 0.53) / (26.28 - z);
+
+function barkSpacedFreqs(A, B, X){
+    const out = new Float64Array(X);
+    if (X === 1){ out[0] = A; return out; }          // generator: X = 1 -> f(0) = A
+    const wa = barkOf(A), wb = barkOf(B);
+    for(let n=0;n<X;n++){
+        if (n === 0) out[n] = A;
+        else if (n === X-1) out[n] = B;            // endpoints exact
+        else out[n] = Math.min(Math.max(hzOfBark(wa + (n/(X-1)) * (wb - wa)), A), B);
+    }
+    return out;
+}
+let BAND_FREQS, BAND_EDGES;
+
+// Band edges: midway between neighbouring centres on the Bark scale (outer edges: half a step beyond the ends).
+function barkBandEdges(){
+    const z = Array.from(BAND_FREQS, barkOf), e = new Float64Array(TARGET_BANDS + 1);
+    if (TARGET_BANDS === 1){ e[0] = LOW_HZ; e[1] = HIGH_HZ; return e; }   // single band spans the whole range
+    for(let i=1;i<TARGET_BANDS;i++) e[i] = hzOfBark((z[i-1] + z[i]) / 2);
+    const half = (z[TARGET_BANDS-1] - z[0]) / (TARGET_BANDS-1) / 2;
+    e[0] = Math.max(0, hzOfBark(z[0] - half));
+    // Cap the top edge: with few bands the half-step would run past the Bark formula's asymptote (26.28).
+    e[TARGET_BANDS] = hzOfBark(Math.min(z[TARGET_BANDS-1] + half, barkOf(24000)));
+    return e;
+}
+
+// (Re)build the band layout for a given band count.
+function setBandCount(n, low = LOW_HZ, high = HIGH_HZ){
+    TARGET_BANDS = n; LOW_HZ = low; HIGH_HZ = high;
+    BAND_FREQS = barkSpacedFreqs(LOW_HZ, HIGH_HZ, n);
+    BAND_EDGES = barkBandEdges();
+}
+setBandCount(DEFAULT_BANDS, DEFAULT_LOW_HZ, DEFAULT_HIGH_HZ);
+
+// Read + validate the three band settings (same rules as make_plan() in sine_generator.py).
+// Returns {n, low, high} or {error}.
+function readBandSettings(){
+    const n = Number(document.getElementById('bands').value);
+    const low = Number(document.getElementById('lowHz').value);
+    const high = Number(document.getElementById('highHz').value);
+    if (!Number.isInteger(n) || n < MIN_BANDS || n > MAX_BANDS)
+        return {error: `Bands must be a whole number from ${MIN_BANDS} to ${MAX_BANDS}.`};
+    if (!Number.isFinite(low) || low < MIN_FREQ_HZ)
+        return {error: `Lowest Hz must be a number of at least ${MIN_FREQ_HZ} Hz.`};
+    if (!Number.isFinite(high) || high > MAX_FREQ_HZ)
+        return {error: `Highest Hz must be a number of at most ${MAX_FREQ_HZ.toLocaleString()} Hz.`};
+    if (n > 1 && high <= low) return {error: 'Highest Hz must be greater than Lowest Hz.'};
+    if (n === 1 && high < low) return {error: 'Highest Hz must not be below Lowest Hz.'};
+    if (n > 1){
+        const f = barkSpacedFreqs(low, high, n);
+        for (let i = 1; i < n; i++) if (!(f[i] > f[i-1]))
+            return {error: 'The range is too narrow for this many bands: neighbouring frequencies are no longer distinct.'};
+    }
+    return {n, low, high};
+}
+
+function updateBandInfo(){
+    const el = document.getElementById('bandInfo'), c = readBandSettings();
+    if (c.error){ el.style.color = '#b3261e'; el.textContent = c.error; return; }
+    el.style.color = '';
+    const f = barkSpacedFreqs(c.low, c.high, c.n);
+    if (c.n === 1){ el.textContent = `1 band at ${f[0]} Hz (${2} characters per frame).`; return; }
+    let minHz = Infinity, maxHz = 0, minCt = Infinity, maxCt = 0;
+    for (let i = 1; i < c.n; i++){
+        const d = f[i] - f[i-1], ct = 1200 * Math.log2(f[i] / f[i-1]);
+        minHz = Math.min(minHz, d); maxHz = Math.max(maxHz, d); minCt = Math.min(minCt, ct); maxCt = Math.max(maxCt, ct);
+    }
+    const g = x => x >= 100 ? x.toFixed(0) : x >= 10 ? x.toFixed(1) : x.toFixed(2);
+    el.textContent = `${c.n} Bark-spaced bands, ${c.low} to ${c.high} Hz — step ${g(minHz)} to ${g(maxHz)} Hz ` +
+        `(${g(minCt)} to ${g(maxCt)} cents), ${c.n * 2} characters per frame.`;
+}
+
+const fileEl = document.getElementById('file');
+const pickBtn = document.getElementById('pick');
+const fileNameEl = document.getElementById('fileName');
+const processBtn = document.getElementById('process');
+const previewBtn = document.getElementById('preview');
+const downloadWavBtn = document.getElementById('downloadWav');
+const logEl = document.getElementById('log');
+const barEl = document.getElementById('bar');
+const framesCountEl = document.getElementById('framesCount');
+
+let audioBuffer = null, generatedLines = [], renderedWavBlob = null;
+
+pickBtn.onclick = () => fileEl.click();
+for (const id of ['bands', 'lowHz', 'highHz']) document.getElementById(id).addEventListener('input', updateBandInfo);
+updateBandInfo();
+
+// Frequency manifest, same layout as the generator's manifest (file -> Hz), so the two can be compared directly.
+document.getElementById('manifest').onclick = () => {
+    const c = readBandSettings(); if (c.error) return alert(c.error);
+    const f = barkSpacedFreqs(c.low, c.high, c.n);
+    downloadFile(Array.from(f, (hz, i) => `${String(i + 1).padStart(4, '0')}f.mp3  ${hz.toFixed(6).padStart(14)} Hz`).join("\n"), "band_frequencies.txt");
+};
+fileEl.onchange = (e) => { fileNameEl.textContent = e.target.files[0] ? e.target.files[0].name : 'No file selected'; };
+
+function log(msg){ logEl.textContent += msg + "\n"; logEl.scrollTop = logEl.scrollHeight; }
+function setProgress(p){ barEl.style.width = Math.max(0, Math.min(1,p))*100 + "%"; }
+
+// --- FFT & Helpers ---
+function bitReverseIndices(n){
+    const rev = new Uint32Array(n); const bits = Math.log2(n);
+    for(let i=0;i<n;i++){ let x=i, r=0; for(let j=0;j<bits;j++){ r = (r<<1) | (x & 1); x >>= 1; } rev[i]=r; }
+    return rev;
+}
+
+function fftReIm(real, imag, inverse=false){
+    const n = real.length; const rev = bitReverseIndices(n);
+    for(let i=0;i<n;i++){ const j = rev[i]; if (j > i) { [real[i], real[j]] = [real[j], real[i]]; [imag[i], imag[j]] = [imag[j], imag[i]]; } }
+    for(let size=2; size<=n; size<<=1){
+        const half = size>>1; const theta = (inverse ? 2 : -2) * Math.PI / size;
+        const wpr = Math.cos(theta), wpi = Math.sin(theta);
+        for(let start=0; start<n; start += size){
+            let wr = 1.0, wi = 0.0;
+            for(let k=0; k<half; k++){
+                const i = start + k, j = i + half;
+                const tr = wr * real[j] - wi * imag[j], ti = wr * imag[j] + wi * real[j];
+                real[j] = real[i] - tr; imag[j] = imag[i] - ti; real[i] += tr; imag[i] += ti;
+                const tmp = wr; wr = wr * wpr - wi * wpi; wi = tmp * wpi + wi * wpr;
+            }
+        }
+    }
+    if (inverse) for(let i=0;i<n;i++){ real[i] /= n; imag[i] /= n; }
+}
+
+function hannWindow(n){
+    const w = new Float32Array(n);
+    for(let i=0;i<n;i++) w[i] = 0.5 * (1 - Math.cos(2*Math.PI*i/(n-1)));
+    return w;
+}
+
+async function computeSTFT(audioBuf, fftSize, hopSize){
+    const sr = audioBuf.sampleRate, numChannels = audioBuf.numberOfChannels;
+    const mono = new Float32Array(audioBuf.length);
+    for(let ch=0; ch<numChannels; ch++){
+        const chData = audioBuf.getChannelData(ch);
+        for(let i=0;i<chData.length;i++) mono[i] += chData[i] / numChannels;
+    }
+    const window = hannWindow(fftSize), totalFrames = Math.max(1, Math.floor((mono.length - fftSize) / hopSize) + 1);
+    const mags = [], phases = [], re = new Float32Array(fftSize), im = new Float32Array(fftSize);
+    let frameIdx=0;
+    for(let offset=0; offset + fftSize <= mono.length; offset += hopSize){
+        for(let i=0;i<fftSize;i++){ re[i] = (mono[offset + i] || 0) * window[i]; im[i] = 0; }
+        fftReIm(re, im, false);
+        const half = fftSize >> 1, mag = new Float32Array(half), ph = new Float32Array(half);
+        for(let k=0;k<half;k++){ mag[k] = Math.hypot(re[k], im[k]); ph[k] = Math.atan2(im[k], re[k]); }
+        mags.push(mag); phases.push(ph);
+        frameIdx++; if ((frameIdx & 15) === 0) setProgress(frameIdx/totalFrames*0.6);
+        if(frameIdx % 50 === 0) await new Promise(r => setTimeout(r, 0));
+    }
+    return {mags, phases, sampleRate: sr};
+}
+
+function mapToFixedBands(magsObj, fftSize){
+    const {mags, phases, sampleRate} = magsObj;
+    const half = fftSize >> 1, freqPerBin = sampleRate / fftSize;
+    const centers = new Float32Array(BAND_FREQS);
+    const bounds = BAND_EDGES;   // Bark-domain midpoints (see barkBandEdges)
+
+    const bandBins = [];
+    for(let b=0;b<TARGET_BANDS;b++){
+        const lo = Math.max(0, Math.floor(bounds[b] / freqPerBin)), hi = Math.min(half-1, Math.ceil(bounds[b+1] / freqPerBin));
+        const arr = []; for(let k=lo; k<=hi; k++) arr.push(k);
+        bandBins.push(arr);
+    }
+
+    const bandMags = mags.map((m, f) => {
+        const bmag = new Float32Array(TARGET_BANDS);
+        for(let b=0;b<TARGET_BANDS;b++){
+            let sum=0; const bins = bandBins[b];
+            for(let idx of bins) sum += m[idx];
+            bmag[b] = sum / (bins.length || 1);
+        }
+        return bmag;
+    });
+    return {bandMags, centers};
+}
+
+function normalizeAndGamma(bandMags, gamma){
+    let maxv = 0;
+    for(let f=0; f<bandMags.length; f++){
+        for(let b=0; b<TARGET_BANDS; b++) if (bandMags[f][b] > maxv) maxv = bandMags[f][b];
+    }
+    if (maxv <= 0) maxv = 1e-12;
+    return bandMags.map(arr => {
+        const o = new Float32Array(TARGET_BANDS);
+        for(let b=0;b<TARGET_BANDS;b++) o[b] = Math.max(0, Math.min(1, Math.pow(arr[b]/maxv, 1.0/gamma)));
+        return o;
+    });
+}
+
+// --- NEW: Numeric encoding (00-99 range) ---
+function encodeFrameNumeric(amplitudes){
+    const levels = 100; 
+    let out = "";
+    for(let i=0; i<TARGET_BANDS; i++){
+        const idx = Math.round(amplitudes[i] * (levels - 1));
+        out += String(idx).padStart(2, '0');
+    }
+    return out;
+}
+
+function downloadFile(content, fname){
+    const blob = new Blob([content], {type: "text/plain;charset=utf-8"});
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = fname; a.click();
+}
+
+// --- Processing ---
+let busy = false;
+processBtn.onclick = async () => {
+    if (busy) return;
+    busy = true; processBtn.disabled = true;
+    try { await processFile(); }
+    catch (err) { log("Error: " + (err && err.message ? err.message : err)); }
+    finally { busy = false; processBtn.disabled = false; }
+};
+
+async function processFile(){
+    const f = fileEl.files[0]; if (!f) return alert("Select a file.");
+    const cfg = readBandSettings();
+    if (cfg.error) return alert(cfg.error);
+    setBandCount(cfg.n, cfg.low, cfg.high);
+    logEl.textContent = ""; setProgress(0.02);
+    const arrayBuffer = await f.arrayBuffer();
+    const actx = new AudioContext();
+    audioBuffer = await actx.decodeAudioData(arrayBuffer);
+    
+    const pps = Number(document.getElementById('pps').value) || 30;
+    const fftSize = Number(document.getElementById('fftSize').value) || 4096;
+    const gamma = Number(document.getElementById('gamma').value) || 1.0;
+    
+    log(`Processing ${f.name}...`);
+    log(`Bands: ${TARGET_BANDS} Bark-spaced, ${LOW_HZ} to ${HIGH_HZ} Hz (${TARGET_BANDS*2} characters per frame)`);
+    if (HIGH_HZ > audioBuffer.sampleRate / 2) log(`Note: Highest Hz (${HIGH_HZ}) is above this file's Nyquist frequency (${audioBuffer.sampleRate/2} Hz); bands above it will be 00.`);
+    if (TARGET_BANDS > fftSize / 2) log(`Note: ${TARGET_BANDS} bands is more than the ${fftSize/2} FFT bins; some bands will share bins.`);
+    const binHz = audioBuffer.sampleRate / fftSize, narrow = BAND_EDGES.reduce((c, e, i) => c + (i > 0 && e - BAND_EDGES[i-1] < binHz ? 1 : 0), 0);
+    if (narrow) log(`Note: ${narrow} low bands are narrower than one FFT bin (${binHz.toFixed(1)} Hz); a larger FFT size separates them better.`);
+    const stft = await computeSTFT(audioBuffer, fftSize, Math.floor(audioBuffer.sampleRate/pps));
+    const map = mapToFixedBands(stft, fftSize);
+    let amps = normalizeAndGamma(map.bandMags, gamma);
+
+    // Encode
+    generatedLines = amps.map(frame => encodeFrameNumeric(frame));
+    framesCountEl.textContent = generatedLines.length;
+    downloadFile(generatedLines.join("\n"), "freqs.txt");
+    log("Saved freqs.txt (Range 00-99 per band).");
+    
+    // Wav generation (simple oscillators)
+    log("Preparing WAV preview...");
+    renderedWavBlob = await renderOfflineWav(map.centers, amps, audioBuffer.sampleRate, pps);
+    previewBtn.disabled = false; downloadWavBtn.disabled = false;
+    setProgress(1);
+}
+
+async function renderOfflineWav(centers, amps, sr, pps){
+    const dur = amps.length / pps, offline = new OfflineAudioContext(1, Math.ceil(dur*sr), sr);
+    const frameDur = 1.0/pps;
+    for(let b=0; b<TARGET_BANDS; b++){
+        const osc = offline.createOscillator(); const g = offline.createGain();
+        osc.frequency.value = centers[b]; g.gain.value = 0;
+        osc.connect(g); g.connect(offline.destination);
+        osc.start(0);
+        for(let f=0; f<amps.length; f++){
+            g.gain.setValueAtTime(amps[f][b] * 0.05, f*frameDur);
+        }
+    }
+    const buf = await offline.startRendering();
+    return audioBufferToWavBlob(buf);
+}
+
+function audioBufferToWavBlob(buffer){
+    const length = buffer.length * 2, view = new DataView(new ArrayBuffer(44 + length));
+    const writeStr = (off, s) => { for(let i=0;i<s.length;i++) view.setUint8(off+i, s.charCodeAt(i)); };
+    writeStr(0, 'RIFF'); view.setUint32(4, 36 + length, true); writeStr(8, 'WAVE'); writeStr(12, 'fmt ');
+    view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+    view.setUint32(24, buffer.sampleRate, true); view.setUint32(28, buffer.sampleRate*2, true);
+    view.setUint16(32, 2, true); view.setUint16(34, 16, true); writeStr(36, 'data'); view.setUint32(40, length, true);
+    const data = buffer.getChannelData(0);
+    for(let i=0; i<data.length; i++) view.setInt16(44+i*2, Math.max(-1,Math.min(1,data[i]))*0x7FFF, true);
+    return new Blob([view], {type: "audio/wav"});
+}
+
+previewBtn.onclick = () => { const a = new Audio(URL.createObjectURL(renderedWavBlob)); a.play(); };
+downloadWavBtn.onclick = () => { const a = document.createElement('a'); a.href=URL.createObjectURL(renderedWavBlob); a.download="resynth.wav"; a.click(); };
+</script>
+</body>
+</html>
